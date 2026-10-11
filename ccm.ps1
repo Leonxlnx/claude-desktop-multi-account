@@ -126,8 +126,8 @@ function Build-App {
     $compiler = Join-Path $framework 'csc.exe'
     if (-not (Test-Path $compiler)) { throw 'The .NET Framework C# compiler (csc.exe) was not found.' }
 
-    # A running copy keeps the file locked.
-    Get-Process ClaudeAccounts -ErrorAction SilentlyContinue | Stop-Process -Force
+    # A running copy of this program keeps the file locked.
+    Get-Process ClaudeAccounts -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe } | Stop-Process -Force
     New-Item -ItemType Directory -Force $Root | Out-Null
     $arguments = @('/nologo', '/target:winexe', '/optimize+', "/out:$Exe")
     $arguments += 'WPF\PresentationFramework.dll', 'WPF\PresentationCore.dll', 'WPF\WindowsBase.dll', 'System.Xaml.dll' |

@@ -93,8 +93,9 @@ Check Anthropic's [Consumer Terms](https://www.anthropic.com/legal/consumer-term
 
 1. Quit `Claude accounts` from its tray icon, and quit the account windows.
 2. Run `ccm remove <name>` for each account.
-3. Delete the `Claude accounts` folder in the Start menu.
+3. Delete the `Claude accounts` folder in the Start menu, and unpin any pinned account icons.
 4. Delete `ccm.ps1` and `ccm.cmd` from `%LOCALAPPDATA%\Microsoft\WindowsApps`.
+5. Delete what is left of `%USERPROFILE%\.claude-accounts` and the cloned folder.
 
 ## License
 
