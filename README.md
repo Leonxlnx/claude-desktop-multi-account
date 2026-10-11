@@ -8,14 +8,14 @@ Run several Claude accounts side by side in the Claude desktop app on Windows: o
 
 - **One window per account.** Each account gets its own data folder, so each window keeps its own sign-in. It is the regular Claude desktop app, unmodified.
 - **Its own taskbar icon.** Each window gets a separate taskbar button with a coloured label (`T1`, `M5`, ...) that you can pin.
-- **Usage window.** `Claude accounts` lists every account with its 5-hour and weekly limit as bars, which windows are open, and when each number was last updated. It also sits in the tray. Click an account to open its window.
+- **Usage window.** `Claude accounts` lists every account with its 5-hour and weekly limit as bars, which windows are open, when each number was last updated, and when the limits reset as far as that can be worked out. It also sits in the tray. Click an account to open its window.
 - **One Claude Code history.** All windows share `~\.claude`, so the usage stats in the Code tab count every account.
 
 ## What it does not do
 
 - It never reads, copies or stores a login, and never talks to Anthropic itself. Signing in happens inside each window through Anthropic's own sign-in.
-- It does not show live usage. The numbers are the ones each Claude window last saved for itself.
-- It cannot show exact reset times, because the app does not save them. When two saved numbers are close enough together, it estimates the weekly reset. The exact times are in each window under **Settings > Usage**.
+- It does not show live usage. The numbers are the ones each Claude window last saved for itself, and a 5-hour number older than five hours is shown as reset.
+- It cannot always show exact reset times, because the desktop app does not save them. It works out the latest moment a limit can reset from the saved numbers ("resets by ... at the latest"), and shows the exact time, including per-model weekly limits such as Fable, when Claude Code's own cached snapshot has it. The exact times are always in each window under **Settings > Usage**.
 - It does not switch accounts for you.
 
 ## Requirements
@@ -73,6 +73,7 @@ Google sign-in does not work in the extra windows. It finishes in your browser a
 - Each account window is the Claude app started with Chromium's `--user-data-dir` switch, pointing at `~\.claude-accounts\<name>`.
 - Windows groups taskbar buttons by app id. While `ClaudeAccounts.exe` runs, it gives each account window, and its shortcut, its own id. That way each account gets a separate, pinnable button.
 - Usage comes from the `plan-usage-history.json` file the app writes in each data folder. A window counts as open while the app holds that folder's `lockfile`.
+- A limit only falls when its window resets, so the oldest saved number in an unbroken run marks a moment the current window already existed; it ends at most five hours (or seven days) later. Exact reset times come from the `cachedUsageUtilization` entry Claude Code keeps in `~\.claude.json`, when it belongs to that account.
 
 ## Known limitations
 
