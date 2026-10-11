@@ -8,14 +8,14 @@ Run several Claude accounts side by side in the Claude desktop app on Windows: o
 
 - **One window per account.** Each account gets its own data folder, so each window keeps its own sign-in. It is the regular Claude desktop app, unmodified.
 - **Its own taskbar icon.** Each window gets a separate taskbar button with a coloured label (`T1`, `M5`, ...) that you can pin.
-- **Start menu shortcuts.** `Claude <name>` for every account, plus `Claude accounts usage` for the tray icon.
-- **Usage tray icon (optional).** Lists every account with the 5-hour and weekly usage the app itself last saved. Click an account to open its window.
+- **Usage window.** `Claude accounts` lists every account with its 5-hour and weekly limit as bars, which windows are open, and when each number was last updated. It also sits in the tray. Click an account to open its window.
 - **One Claude Code history.** All windows share `~\.claude`, so the usage stats in the Code tab count every account.
 
 ## What it does not do
 
 - It never reads, copies or stores a login, and never talks to Anthropic itself. Signing in happens inside each window through Anthropic's own sign-in.
-- It does not show live usage or reset times. The tray shows what each window last saved, with the time it was saved.
+- It does not show live usage. The numbers are the ones each Claude window last saved for itself.
+- It cannot show exact reset times, because the app does not save them. When two saved numbers are close enough together, it estimates the weekly reset. The exact times are in each window under **Settings > Usage**.
 - It does not switch accounts for you.
 
 ## Requirements
@@ -23,6 +23,8 @@ Run several Claude accounts side by side in the Claude desktop app on Windows: o
 - Windows 10 or 11
 - The Claude desktop app for Windows (the current installer, which provides `claude-desktop.exe`)
 - PowerShell 7: `winget install Microsoft.PowerShell`
+
+The usage window is a small program (`ClaudeAccounts.exe`) that is compiled on your PC from `ClaudeAccounts.cs`, using the C# compiler that ships with Windows. No prebuilt binaries are downloaded.
 
 ## Install
 
@@ -32,7 +34,7 @@ cd claude-desktop-multi-account
 .\ccm.cmd install
 ```
 
-`install` puts a small `ccm` launcher next to `claude-desktop.exe`, so `ccm` works in any new terminal. Keep the cloned folder where it is; the shortcuts start from it.
+`install` builds `ClaudeAccounts.exe`, creates the Start menu shortcuts, and puts a small `ccm` launcher next to `claude-desktop.exe` so `ccm` works in any new terminal. Keep the cloned folder where it is; the shortcuts start from it.
 
 ## Use
 
@@ -43,10 +45,10 @@ cd claude-desktop-multi-account
    ccm add personal
    ```
 
-2. Open `Claude work` from the Start menu (or run `ccm work`).
+2. Open `Claude work` from the Start menu.
 3. Sign in with **Continue with email**, then type the verification code from the email link into that window. See the note on Google below.
 4. Right-click its taskbar icon and choose **Pin to taskbar**. After a restart, click the pinned icons; every window is still signed in.
-5. Optional: open `Claude accounts usage` from the Start menu for the tray icon.
+5. Open `Claude accounts` from the Start menu for the usage window. You can pin that too.
 
 ### Signing in with Google
 
@@ -58,25 +60,27 @@ Google sign-in does not work in the extra windows. It finishes in your browser a
 | --- | --- |
 | `ccm add <name>` | Create an account window and its Start menu shortcut |
 | `ccm <name>` | Open that account's window, or bring it forward |
-| `ccm list` | Show every account, which are open, and their last saved usage |
-| `ccm tray` | The same list as a tray icon |
+| `ccm usage` | Open the usage window |
+| `ccm list` | The same numbers as text |
 | `ccm rename <old> <new>` | Rename an account (quit its window first; the sign-in moves with it) |
 | `ccm remove <name>` | Delete an account window and its saved sign-in (Claude Code history is kept) |
-| `ccm shortcuts` | Recreate the shortcuts and icons |
-| `ccm install` | Make `ccm` available in every terminal |
+| `ccm shortcuts` | Recreate the shortcuts and icons, including pinned ones |
+| `ccm build` | Rebuild `ClaudeAccounts.exe` |
+| `ccm install` | Build, create shortcuts, and make `ccm` available in every terminal |
 
 ## How it works
 
 - Each account window is the Claude app started with Chromium's `--user-data-dir` switch, pointing at `~\.claude-accounts\<name>`.
-- Windows groups taskbar buttons by app id. `ccm` gives each account window and its shortcut its own id, so they get separate, pinnable buttons.
-- Usage comes from the `plan-usage-history.json` file the app writes in each data folder.
+- Windows groups taskbar buttons by app id. While `ClaudeAccounts.exe` runs, it gives each account window, and its shortcut, its own id. That way each account gets a separate, pinnable button.
+- Usage comes from the `plan-usage-history.json` file the app writes in each data folder. A window counts as open while the app holds that folder's `lockfile`.
 
 ## Known limitations
 
 - **Links:** `claude://` links always open in the normal Claude app.
 - **Claude in Chrome:** the browser extension connects to whichever window registered last.
-- **Taskbar grouping:** a window reopened from its tray icon can fall back under the normal Claude taskbar button. Clicking its pinned icon fixes that.
+- **Separate taskbar buttons:** these need `ClaudeAccounts.exe` running. It starts by itself when you open an account through its shortcut and stays in the tray.
 - **Code tab chat list:** each new window starts with an empty list. The app's built-in import skips sessions that belong to another account's list.
+- **Closing a window:** this hides it to the tray instead of quitting. Quit it from its tray icon to free memory.
 - **App updates:** this relies on a standard Chromium switch, not a documented Claude feature, so an app update could stop it working. Your normal Claude app is not affected.
 - **Platforms:** Windows only for now.
 
@@ -86,7 +90,7 @@ Check Anthropic's [Consumer Terms](https://www.anthropic.com/legal/consumer-term
 
 ## Uninstall
 
-1. Quit the account windows.
+1. Quit `Claude accounts` from its tray icon, and quit the account windows.
 2. Run `ccm remove <name>` for each account.
 3. Delete the `Claude accounts` folder in the Start menu.
 4. Delete `ccm.ps1` and `ccm.cmd` from `%LOCALAPPDATA%\Microsoft\WindowsApps`.

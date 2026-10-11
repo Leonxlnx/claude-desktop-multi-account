@@ -4,8 +4,11 @@
 # menu shortcut that opens the normal Claude desktop app on that folder. Every window
 # still uses the same ~\.claude, so Code sessions from all accounts land in one
 # history and the usage stats count all of them.
-# ccm only starts the app. Signing in happens inside each window, and ccm never
-# reads or copies a login.
+#
+# This script manages the accounts (add, rename, remove, shortcuts, icons).
+# ClaudeAccounts.exe, built from ClaudeAccounts.cs, opens the windows, gives each its
+# own taskbar button and shows the usage window. Neither reads or copies a login;
+# signing in happens inside each Claude window.
 
 $ErrorActionPreference = 'Stop'
 
@@ -13,7 +16,8 @@ $Root = if ($env:CCM_HOME) { $env:CCM_HOME } else { Join-Path $HOME '.claude-acc
 $Shortcuts = Join-Path ([Environment]::GetFolderPath('Programs')) 'Claude accounts'
 $App = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\claude-desktop.exe'
 $MainData = Join-Path $env:APPDATA 'Claude'
-$Reserved = 'add', 'list', 'ls', 'remove', 'rm', 'rename', 'shortcuts', 'tray', 'install', 'help'
+$Exe = Join-Path $PSScriptRoot 'ClaudeAccounts.exe'
+$Reserved = 'add', 'list', 'ls', 'remove', 'rm', 'rename', 'shortcuts', 'usage', 'build', 'install', 'help'
 $Colors = '#2563EB', '#16A34A', '#7C3AED', '#DB2777', '#0D9488', '#475569', '#B45309', '#DC2626'
 
 function Show-Help {
@@ -22,12 +26,13 @@ ccm - keep several Claude accounts open side by side in the desktop app
 
   ccm add <name>     create an account window and its Start menu shortcut
   ccm <name>         open that account's window (same as clicking "Claude <name>")
-  ccm list           show accounts, which are open, and their last known plan usage
-  ccm tray           the same list as a tray icon; click an account to open it
-  ccm remove <name>  delete an account window and its saved sign-in (history is kept)
+  ccm usage          open the usage window (also lives in the tray)
+  ccm list           the same numbers as text
   ccm rename <a> <b> give an account a different name (its window must be closed)
-  ccm shortcuts      recreate the shortcuts and icons, and re-tag open windows
-  ccm install        make the ccm command available in every terminal
+  ccm remove <name>  delete an account window and its saved sign-in (history is kept)
+  ccm shortcuts      recreate the Start menu shortcuts and their icons
+  ccm build          rebuild ClaudeAccounts.exe from ClaudeAccounts.cs
+  ccm install        build, and make the ccm command available in every terminal
 '@
 }
 
@@ -45,26 +50,107 @@ function Get-ExistingAccountDir($name) {
     return $data
 }
 
-function Get-AppProcesses {
-    @(Get-CimInstance Win32_Process -Filter "Name='claude.exe'" |
-        Where-Object { $_.ExecutablePath -like '*\WindowsApps\*' })
+# The app keeps `lockfile` open for as long as a window on that folder is running.
+function Test-Open($data) {
+    $file = Join-Path $data 'lockfile'
+    if (-not (Test-Path -LiteralPath $file)) { return $false }
+    try { [IO.File]::Open($file, 'Open', 'ReadWrite', 'None').Dispose(); return $false }
+    catch { return $true }
 }
 
-function Get-AccountProcesses($data, $processes) {
-    $pattern = [regex]::Escape($data) + '(["\s]|$)'
-    @($processes | Where-Object { $_.CommandLine -match $pattern })
+function Get-AppExe {
+    if (-not $script:AppExe) {
+        $script:AppExe = Join-Path (Get-AppxPackage -Name Claude -WarningAction SilentlyContinue).InstallLocation 'app\Claude.exe'
+    }
+    return $script:AppExe
 }
 
-function Test-Open($data, $processes) {
-    return [bool](Get-AccountProcesses $data $processes)
+# team1 -> T1, max20a -> M20a: short enough to read on a taskbar icon.
+function Get-Label($name) {
+    if ($name -match '^([A-Za-z])[A-Za-z]*(\d.*)$') { return $Matches[1].ToUpper() + $Matches[2] }
+    return $name.Substring(0, [Math]::Min(3, $name.Length))
 }
 
-# Windows groups taskbar buttons by app id, and every Claude window reports the same
-# one. Writing our own id onto a window (and onto its shortcut) gives that account a
-# separate taskbar button with its own icon, which can then be pinned.
-function Import-ShellHelper {
-    if ('CcmShell' -as [type]) { return }
-    Add-Type -TypeDefinition @'
+# Draw the Claude icon with a coloured tag and save it as an .ico. The icon is copied
+# out of the installed app, so the file keeps working after app updates.
+function New-TaggedIcon($label, $color, $path) {
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $bitmap = [Drawing.Icon]::ExtractIcon((Get-AppExe), 0, 256).ToBitmap()
+        $graphics = [Drawing.Graphics]::FromImage($bitmap)
+        $graphics.SmoothingMode = 'AntiAlias'
+        $graphics.TextRenderingHint = 'AntiAlias'
+
+        $tag = [Drawing.Rectangle]::new(8, 118, 240, 130)
+        $corner = 88
+        $shape = [Drawing.Drawing2D.GraphicsPath]::new()
+        $shape.AddArc($tag.X, $tag.Y, $corner, $corner, 180, 90)
+        $shape.AddArc($tag.Right - $corner, $tag.Y, $corner, $corner, 270, 90)
+        $shape.AddArc($tag.Right - $corner, $tag.Bottom - $corner, $corner, $corner, 0, 90)
+        $shape.AddArc($tag.X, $tag.Bottom - $corner, $corner, $corner, 90, 90)
+        $shape.CloseFigure()
+        $graphics.FillPath([Drawing.SolidBrush]::new([Drawing.ColorTranslator]::FromHtml($color)), $shape)
+
+        $size = 104
+        do {
+            $size -= 4
+            $font = [Drawing.Font]::new('Segoe UI', $size, [Drawing.FontStyle]::Bold, [Drawing.GraphicsUnit]::Pixel)
+        } while ($graphics.MeasureString($label, $font).Width -gt $tag.Width -and $size -gt 24)
+        $format = [Drawing.StringFormat]::new()
+        $format.Alignment = 'Center'
+        $format.LineAlignment = 'Center'
+        $graphics.DrawString($label, $font, [Drawing.Brushes]::White, [Drawing.RectangleF]$tag, $format)
+        $graphics.Dispose()
+
+        # A .ico file holding one 256px PNG: 6-byte header, 16-byte entry, then the image.
+        $png = [IO.MemoryStream]::new()
+        $bitmap.Save($png, [Drawing.Imaging.ImageFormat]::Png)
+        $header = [byte[]](0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 32, 0) +
+            [BitConverter]::GetBytes([int]$png.Length) + [BitConverter]::GetBytes(22)
+        [IO.File]::WriteAllBytes($path, $header + $png.ToArray())
+        return $path
+    }
+    catch { return $null }
+}
+
+function New-AccountIcon($name, $data) {
+    $order = @(Get-ChildItem -LiteralPath $Root -Directory | Sort-Object CreationTime, Name | ForEach-Object FullName)
+    $color = $Colors[[Array]::IndexOf($order, $data) % $Colors.Count]
+    New-TaggedIcon (Get-Label $name) $color (Join-Path $data 'ccm-icon.ico')
+}
+
+# Compile ClaudeAccounts.exe with the C# compiler that ships with Windows.
+function Build-App {
+    $framework = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319'
+    if (-not (Test-Path (Join-Path $framework 'csc.exe'))) { $framework = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319' }
+    $compiler = Join-Path $framework 'csc.exe'
+    if (-not (Test-Path $compiler)) { throw 'The .NET Framework C# compiler (csc.exe) was not found.' }
+
+    # A running copy keeps the file locked.
+    Get-Process ClaudeAccounts -ErrorAction SilentlyContinue | Stop-Process -Force
+    New-Item -ItemType Directory -Force $Root | Out-Null
+    $arguments = @('/nologo', '/target:winexe', '/optimize+', "/out:$Exe")
+    $arguments += 'WPF\PresentationFramework.dll', 'WPF\PresentationCore.dll', 'WPF\WindowsBase.dll', 'System.Xaml.dll' |
+        ForEach-Object { "/reference:$(Join-Path $framework $_)" }
+    $icon = New-TaggedIcon '%' '#334155' (Join-Path $Root 'usage.ico')
+    if ($icon) { $arguments += "/win32icon:$icon" }
+    $output = & $compiler @arguments (Join-Path $PSScriptRoot 'ClaudeAccounts.cs')
+    if ($LASTEXITCODE -ne 0) { throw "Build failed:`n$($output -join "`n")" }
+    "Built $Exe"
+}
+
+# Build on first use, and again whenever the source is newer than the program.
+function Get-Exe {
+    $source = Get-Item -LiteralPath (Join-Path $PSScriptRoot 'ClaudeAccounts.cs')
+    $built = Get-Item -LiteralPath $Exe -ErrorAction SilentlyContinue
+    if (-not $built -or $built.LastWriteTime -lt $source.LastWriteTime) { Build-App | Out-Null }
+    return $Exe
+}
+
+# Lets a pinned shortcut and the running window share one taskbar button.
+function Set-ShortcutAppId($path, $appId) {
+    if (-not ('CcmShell' -as [type])) {
+        Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
@@ -86,177 +172,63 @@ public static class CcmShell
         [PreserveSig] int Commit();
     }
 
-    [DllImport("shell32.dll")]
-    static extern int SHGetPropertyStoreForWindow(IntPtr window, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
-
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     static extern int SHGetPropertyStoreFromParsingName(string path, IntPtr bindContext, int flags, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out IPropertyStore store);
 
-    // System.AppUserModel properties: 5 = app id, 2 = relaunch command, 3 = icon, 4 = display name.
-    static readonly Guid AppUserModel = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
-    const ushort VT_LPWSTR = 31;
-    const int GPS_READWRITE = 2;
-
-    static void Set(IPropertyStore store, uint id, string text)
+    // System.AppUserModel.ID, written as a string, on a store opened for writing.
+    public static void SetAppId(string path, string appId)
     {
-        var key = new PropertyKey { FormatId = AppUserModel, PropertyId = id };
-        var value = new PropVariant { Type = VT_LPWSTR, Pointer = Marshal.StringToCoTaskMemUni(text) };
+        var iid = typeof(IPropertyStore).GUID;
+        IPropertyStore store;
+        Marshal.ThrowExceptionForHR(SHGetPropertyStoreFromParsingName(path, IntPtr.Zero, 2, ref iid, out store));
+        var key = new PropertyKey { FormatId = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), PropertyId = 5 };
+        var value = new PropVariant { Type = 31, Pointer = Marshal.StringToCoTaskMemUni(appId) };
         try { Marshal.ThrowExceptionForHR(store.SetValue(ref key, ref value)); }
         finally { Marshal.FreeCoTaskMem(value.Pointer); }
-    }
-
-    public static void TagWindow(IntPtr window, string appId, string command, string icon, string name)
-    {
-        var iid = typeof(IPropertyStore).GUID;
-        IPropertyStore store;
-        Marshal.ThrowExceptionForHR(SHGetPropertyStoreForWindow(window, ref iid, out store));
-        Set(store, 5, appId);
-        Set(store, 3, icon);
-        Set(store, 2, command);
-        Set(store, 4, name);
-        store.Commit();
-        Marshal.ReleaseComObject(store);
-    }
-
-    public static void TagShortcut(string path, string appId)
-    {
-        var iid = typeof(IPropertyStore).GUID;
-        IPropertyStore store;
-        Marshal.ThrowExceptionForHR(SHGetPropertyStoreFromParsingName(path, IntPtr.Zero, GPS_READWRITE, ref iid, out store));
-        Set(store, 5, appId);
         Marshal.ThrowExceptionForHR(store.Commit());
         Marshal.ReleaseComObject(store);
     }
 }
 '@
-}
-
-# The command a shortcut or pinned taskbar icon runs: this script, without a console window.
-function Get-LaunchCommand($name) {
-    $console = Join-Path $env:SystemRoot 'System32\conhost.exe'
-    $shell = (Get-Process -Id $PID).Path
-    $arguments = "--headless `"$shell`" -NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $PSScriptRoot 'ccm.ps1')`" $name"
-    return $console, $arguments
-}
-
-# Tag the account's window once it exists. The app can swap its first window for
-# another while starting, so keep checking until the handle has stopped changing.
-function Set-TaskbarIdentity($name, $data, $seconds = 20) {
-    Import-ShellHelper
-    $console, $arguments = Get-LaunchCommand $name
-    $tagged = [IntPtr]::Zero
-    $stable = 0
-    $main = $null
-    $deadline = (Get-Date).AddSeconds($seconds)
-    while ((Get-Date) -lt $deadline -and $stable -lt 4) {
-        if (-not $main) {
-            $main = Get-AccountProcesses $data (Get-AppProcesses) | Where-Object { $_.CommandLine -notmatch '--type=' } | Select-Object -First 1
-        }
-        $window = if ($main) { (Get-Process -Id $main.ProcessId -ErrorAction SilentlyContinue).MainWindowHandle } else { [IntPtr]::Zero }
-        if ($window -and $window -ne [IntPtr]::Zero -and $window -ne $tagged) {
-            [CcmShell]::TagWindow($window, "ClaudeAccounts.$name", "`"$console`" $arguments", (Join-Path $data 'ccm-icon.ico'), "Claude $name")
-            $tagged = $window
-            $stable = 0
-        }
-        elseif ($tagged -ne [IntPtr]::Zero) { $stable++ }
-        Start-Sleep -Milliseconds 500
     }
+    try { [CcmShell]::SetAppId($path, $appId) } catch { }
 }
 
-# team1 -> T1, max20a -> M20a: short enough to read on a taskbar icon.
-function Get-Label($name) {
-    if ($name -match '^([A-Za-z])[A-Za-z]*(\d.*)$') { return $Matches[1].ToUpper() + $Matches[2] }
-    return $name.Substring(0, [Math]::Min(3, $name.Length))
-}
-
-# Draw the Claude icon with a coloured name tag so pinned shortcuts can be told apart.
-# The file is kept in the account folder, which survives app updates.
-function Get-AppExe {
-    if (-not $script:AppExe) {
-        $script:AppExe = Join-Path (Get-AppxPackage -Name Claude -WarningAction SilentlyContinue).InstallLocation 'app\Claude.exe'
-    }
-    return $script:AppExe
-}
-
-function New-AccountIcon($name, $data) {
-    try {
-        Add-Type -AssemblyName System.Drawing
-        $order = @(Get-ChildItem -LiteralPath $Root -Directory | Sort-Object CreationTime, Name | ForEach-Object FullName)
-        $color = [Drawing.ColorTranslator]::FromHtml($Colors[[Array]::IndexOf($order, $data) % $Colors.Count])
-
-        $bitmap = [Drawing.Icon]::ExtractIcon((Get-AppExe), 0, 256).ToBitmap()
-        $graphics = [Drawing.Graphics]::FromImage($bitmap)
-        $graphics.SmoothingMode = 'AntiAlias'
-        $graphics.TextRenderingHint = 'AntiAlias'
-
-        $tag = [Drawing.Rectangle]::new(8, 118, 240, 130)
-        $corner = 88
-        $shape = [Drawing.Drawing2D.GraphicsPath]::new()
-        $shape.AddArc($tag.X, $tag.Y, $corner, $corner, 180, 90)
-        $shape.AddArc($tag.Right - $corner, $tag.Y, $corner, $corner, 270, 90)
-        $shape.AddArc($tag.Right - $corner, $tag.Bottom - $corner, $corner, $corner, 0, 90)
-        $shape.AddArc($tag.X, $tag.Bottom - $corner, $corner, $corner, 90, 90)
-        $shape.CloseFigure()
-        $graphics.FillPath([Drawing.SolidBrush]::new($color), $shape)
-
-        $label = Get-Label $name
-        $size = 104
-        do {
-            $size -= 4
-            $font = [Drawing.Font]::new('Segoe UI', $size, [Drawing.FontStyle]::Bold, [Drawing.GraphicsUnit]::Pixel)
-        } while ($graphics.MeasureString($label, $font).Width -gt $tag.Width -and $size -gt 24)
-        $format = [Drawing.StringFormat]::new()
-        $format.Alignment = 'Center'
-        $format.LineAlignment = 'Center'
-        $graphics.DrawString($label, $font, [Drawing.Brushes]::White, [Drawing.RectangleF]$tag, $format)
-        $graphics.Dispose()
-
-        # A .ico file holding one 256px PNG: 6-byte header, 16-byte entry, then the image.
-        $png = [IO.MemoryStream]::new()
-        $bitmap.Save($png, [Drawing.Imaging.ImageFormat]::Png)
-        $header = [byte[]](0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 32, 0) +
-            [BitConverter]::GetBytes([int]$png.Length) + [BitConverter]::GetBytes(22)
-        $icon = Join-Path $data 'ccm-icon.ico'
-        [IO.File]::WriteAllBytes($icon, $header + $png.ToArray())
-        return $icon
-    }
-    catch { return $null }
-}
-
-function Set-Shortcut($name, $data) {
+function Set-Shortcut($path, $arguments, $description, $icon, $appId) {
     New-Item -ItemType Directory -Force $Shortcuts | Out-Null
-    $path = Join-Path $Shortcuts "Claude $name.lnk"
     $link = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
-    $console, $arguments = Get-LaunchCommand $name
-    $link.TargetPath = $console
+    $link.TargetPath = Get-Exe
     $link.Arguments = $arguments
-    $link.Description = "Claude desktop app, account '$name'"
-    $icon = New-AccountIcon $name $data
+    $link.Description = $description
     if ($icon) { $link.IconLocation = "$icon,0" }
     $link.Save()
-    # Same app id as the window, so a pinned shortcut and the running window share one button.
-    try { Import-ShellHelper; [CcmShell]::TagShortcut($path, "ClaudeAccounts.$name") } catch { }
+    Set-ShortcutAppId $path $appId
 }
 
-# Starts the tray icon, so usage can be checked without a terminal.
+function Set-AccountShortcut($name, $data) {
+    Set-Shortcut (Join-Path $Shortcuts "Claude $name.lnk") "open $name" "Claude desktop app, account '$name'" `
+        (New-AccountIcon $name $data) "ClaudeAccounts.$name"
+}
+
 function Set-UsageShortcut {
-    New-Item -ItemType Directory -Force $Shortcuts | Out-Null
-    $link = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $Shortcuts 'Claude accounts usage.lnk'))
-    $console, $arguments = Get-LaunchCommand 'tray'
-    $link.TargetPath = $console
-    $link.Arguments = $arguments
-    $link.Description = 'Tray icon with every Claude account and its last saved plan usage'
-    $link.Save()
+    Remove-Item -LiteralPath (Join-Path $Shortcuts 'Claude accounts usage.lnk') -Force -ErrorAction SilentlyContinue
+    Set-Shortcut (Join-Path $Shortcuts 'Claude accounts.lnk') '' 'Every Claude account and its last saved plan usage' `
+        $null 'ClaudeAccounts.Usage'
 }
 
 function Update-Shortcuts {
-    $processes = Get-AppProcesses
-    Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        Set-Shortcut $_.Name $_.FullName
-        # Windows sitting in the tray have no window to tag; they get tagged when next opened.
-        if (Test-Open $_.FullName $processes) { Set-TaskbarIdentity $_.Name $_.FullName 3 }
-    }
+    Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Set-AccountShortcut $_.Name $_.FullName }
     Set-UsageShortcut
+    # Pinned taskbar icons are copies of the shortcuts; keep them on the current launcher too.
+    $pinned = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+    Get-ChildItem -LiteralPath $pinned -Filter 'Claude *.lnk' -ErrorAction SilentlyContinue | ForEach-Object {
+        $name = $_.BaseName.Substring('Claude '.Length)
+        $data = Join-Path $Root $name
+        if ($name -notin $Reserved -and (Test-Path -LiteralPath $data)) {
+            Set-Shortcut $_.FullName "open $name" "Claude desktop app, account '$name'" (Join-Path $data 'ccm-icon.ico') "ClaudeAccounts.$name"
+        }
+    }
     "Shortcuts are in the Start menu under 'Claude accounts'."
 }
 
@@ -265,105 +237,47 @@ function New-Account($name) {
     if (Test-Path -LiteralPath $data) { throw "Account '$name' already exists." }
     if (-not (Test-Path -LiteralPath $App)) { throw 'The Claude desktop app is not installed (claude-desktop.exe not found).' }
     New-Item -ItemType Directory -Force $data | Out-Null
-    Set-Shortcut $name $data
+    Set-AccountShortcut $name $data
     Set-UsageShortcut
     "Created '$name'. Open it from the Start menu (`"Claude $name`") or with: ccm $name"
 }
 
 function Open-Account($name) {
-    $data = Get-ExistingAccountDir $name
-    Start-Process $App -ArgumentList "--user-data-dir=`"$data`""
+    Get-ExistingAccountDir $name | Out-Null
+    Start-Process (Get-Exe) -ArgumentList 'open', $name
     "Opening Claude for '$name'."
-    Set-TaskbarIdentity $name $data
 }
 
 # The desktop app records its own plan usage samples per window; show the latest one.
-function Get-Row($label, $data, $processes) {
+function Get-Row($label, $data) {
     $row = [ordered]@{
         Account  = $label
-        Status   = if (Test-Open $data $processes) { 'open' } else { 'closed' }
+        Status   = if (Test-Open $data) { 'open' } else { 'closed' }
         '5h %'   = $null
         'Week %' = $null
-        Checked  = 'never signed in'
+        Saved    = 'never signed in'
     }
     try {
         $samples = (Get-Content -LiteralPath (Join-Path $data 'plan-usage-history.json') -Raw | ConvertFrom-Json).samples
         $last = $samples | Sort-Object t | Select-Object -Last 1
         $row['5h %'] = $last.u.fh
         $row['Week %'] = $last.u.sd
-        $row.Checked = [DateTimeOffset]::FromUnixTimeMilliseconds($last.t).LocalDateTime.ToString('g')
+        $row.Saved = [DateTimeOffset]::FromUnixTimeMilliseconds($last.t).LocalDateTime.ToString('g')
     }
     catch { }
     [pscustomobject]$row
 }
 
-function Get-Rows {
-    $processes = Get-AppProcesses
-    Get-Row '(main app)' $MainData $processes
-    Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue |
-        ForEach-Object { Get-Row $_.Name $_.FullName $processes }
-}
-
 function Show-Accounts {
-    Get-Rows | Format-Table -AutoSize
-}
-
-function Update-TrayMenu($menu, $tray) {
-    $menu.Items.Clear()
-    foreach ($row in Get-Rows) {
-        # Some plans report no weekly figure.
-        $fiveHour, $week = $row.'5h %', $row.'Week %' | ForEach-Object { if ($null -ne $_) { "$_%" } else { 'n/a' } }
-        $usage = if ($row.Checked -eq 'never signed in') { 'not signed in yet' }
-            else { "5h $fiveHour  |  week $week  |  as of $($row.Checked)" }
-        $item = $menu.Items.Add("$($row.Account)    $usage")
-        if ($row.Status -eq 'open') { $item.Font = [Drawing.Font]::new($item.Font, [Drawing.FontStyle]::Bold) }
-        $target, $arguments = if ($row.Account -eq '(main app)') { $App, '' } else { Get-LaunchCommand $row.Account }
-        $item.add_Click({ if ($arguments) { Start-Process $target -ArgumentList $arguments } else { Start-Process $target } }.GetNewClosure())
-    }
-    [void]$menu.Items.Add('-')
-    $note = $menu.Items.Add('Numbers are what each window last saved. Bold = open.')
-    $note.Enabled = $false
-    [void]$menu.Items.Add('Quit tray icon', $null, { $tray.Visible = $false; [Windows.Forms.Application]::Exit() }.GetNewClosure())
-}
-
-# A tray icon whose menu lists every account with its last saved usage. Clicking an
-# account opens (or brings forward) its window. The rows are rebuilt each time the
-# menu opens, so they are as fresh as the files the app has written.
-function Start-Tray {
-    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-    $isFirst = $false
-    $mutex = [Threading.Mutex]::new($true, 'ccm-tray', [ref]$isFirst)
-    if (-not $isFirst) { return 'The tray icon is already running.' }
-
-    $tray = [Windows.Forms.NotifyIcon]::new()
-    $tray.Text = 'Claude accounts'
-    try { $tray.Icon = [Drawing.Icon]::ExtractIcon((Get-AppExe), 0, 32) } catch { $tray.Icon = [Drawing.SystemIcons]::Application }
-    $menu = [Windows.Forms.ContextMenuStrip]::new()
-    $tray.ContextMenuStrip = $menu
-
-    $menu.add_Opening({
-        Update-TrayMenu $menu $tray
-        # WinForms cancels opening a menu that was empty when the click came in.
-        $_.Cancel = $false
-    })
-    # Left click opens the same menu as right click.
-    $tray.add_MouseUp({
-        if ($_.Button -eq [Windows.Forms.MouseButtons]::Left) {
-            [Windows.Forms.NotifyIcon].GetMethod('ShowContextMenu', [Reflection.BindingFlags]'Instance,NonPublic').Invoke($tray, $null)
-        }
-    })
-
-    $tray.Visible = $true
-    [Windows.Forms.Application]::Run()
-    $tray.Dispose()
-    $mutex.ReleaseMutex()
+    $rows = @(Get-Row '(normal app)' $MainData)
+    Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { $rows += Get-Row $_.Name $_.FullName }
+    $rows | Format-Table -AutoSize
 }
 
 function Remove-Account($name, $skipPrompt) {
     $data = Get-ExistingAccountDir $name
-    if (Test-Open $data (Get-AppProcesses)) {
-        throw "The Claude window for '$name' is still running. Quit it first (tray icon > Quit)."
-    }
+    if (Test-Open $data) { throw "The Claude window for '$name' is still running. Quit it first (tray icon > Quit)." }
     if (-not $skipPrompt) {
         $answer = Read-Host "Delete the '$name' window, its saved sign-in and local app data? Code history is kept. Type the name to confirm"
         if ($answer -ne $name) { return 'Cancelled.' }
@@ -378,17 +292,17 @@ function Rename-Account($old, $new) {
     $from = Get-ExistingAccountDir $old
     $to = Get-AccountDir $new
     if (Test-Path -LiteralPath $to) { throw "Account '$new' already exists." }
-    if (Test-Open $from (Get-AppProcesses)) {
-        throw "The Claude window for '$old' is still running. Quit it first (tray icon > Quit)."
-    }
+    if (Test-Open $from) { throw "The Claude window for '$old' is still running. Quit it first (tray icon > Quit)." }
     Remove-Item -LiteralPath (Join-Path $Shortcuts "Claude $old.lnk") -Force -ErrorAction SilentlyContinue
     Rename-Item -LiteralPath $from -NewName $new
-    Set-Shortcut $new $to
+    Set-AccountShortcut $new $to
     "Renamed '$old' to '$new'."
 }
 
 # Drop small launchers next to claude-desktop.exe, a folder Windows already has on PATH.
 function Install-Ccm {
+    Build-App
+    Update-Shortcuts
     $bin = Split-Path $App
     $script = Join-Path $PSScriptRoot 'ccm.ps1'
     Set-Content -LiteralPath (Join-Path $bin 'ccm.ps1') -Value "& '$script' @args`r`nexit `$LASTEXITCODE"
@@ -404,10 +318,11 @@ try {
         { $_ -in 'help', '-h', '--help' } { Show-Help }
         'add' { New-Account $rest[0] }
         { $_ -in 'list', 'ls' } { Show-Accounts }
+        'usage' { Start-Process (Get-Exe) }
         { $_ -in 'remove', 'rm' } { Remove-Account $rest[0] ($rest -contains '--yes') }
         'rename' { Rename-Account $rest[0] $rest[1] }
         'shortcuts' { Update-Shortcuts }
-        'tray' { Start-Tray }
+        'build' { Build-App }
         'install' { Install-Ccm }
         default { Open-Account $command }
     }
