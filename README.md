@@ -2,6 +2,8 @@
 
 Run several Claude accounts side by side in the Claude desktop app on Windows: one window per account, each with its own taskbar icon, and no signing out and back in.
 
+On a Mac, see [macos/README.md](macos/README.md).
+
 > Unofficial. Not affiliated with or endorsed by Anthropic.
 
 ## What it does
@@ -83,7 +85,7 @@ Google sign-in does not work in the extra windows. It finishes in your browser a
 - **Code tab chat list:** each new window starts with an empty list. The app's built-in import skips sessions that belong to another account's list.
 - **Closing a window:** this hides it to the tray instead of quitting. Quit it from its tray icon to free memory.
 - **App updates:** this relies on a standard Chromium switch, not a documented Claude feature, so an app update could stop it working. Your normal Claude app is not affected.
-- **Platforms:** Windows only for now.
+- **Platforms:** this page is about Windows. The macOS version is in [`macos`](macos/README.md).
 
 ## Terms
 

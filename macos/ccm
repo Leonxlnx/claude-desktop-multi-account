@@ -1,0 +1,264 @@
+#!/bin/bash
+# ccm - keep several Claude accounts open side by side in the desktop app on macOS.
+#
+# Each account gets its own data folder under ~/.claude-accounts/<name> and a small
+# launcher app, ~/Applications/Claude accounts/Claude <name>.app, that opens the
+# Claude desktop app on that folder. The window runs from a space-free APFS copy of
+# Claude.app with the account's icon, so the Dock shows which account it is. Every
+# window still uses the same ~/.claude,
+# so Code sessions from all accounts land in one history and the usage stats count
+# all of them.
+#
+# This script manages the accounts (add, rename, remove, launchers, icons).
+# Claude accounts.app, built from ClaudeAccounts.swift, opens the windows and shows
+# the usage in the menu bar. Neither reads or copies a login; signing in happens
+# inside each Claude window.
+
+set -euo pipefail
+
+# Follow the symlink `ccm install` puts on PATH back to the cloned folder.
+source=${BASH_SOURCE[0]}
+while [ -L "$source" ]; do
+    dir=$(cd -P "$(dirname "$source")" && pwd)
+    source=$(readlink "$source")
+    case $source in /*) ;; *) source=$dir/$source ;; esac
+done
+Here=$(cd -P "$(dirname "$source")" && pwd)
+
+Root=${CCM_HOME:-$HOME/.claude-accounts}
+case $Root in /*) ;; *) Root=$PWD/$Root ;; esac
+Apps=${CCM_APPS:-$HOME/Applications/Claude accounts}
+UsageApp="$Apps/Claude accounts.app"
+Exe="$UsageApp/Contents/MacOS/ClaudeAccounts"
+Source="$Here/ClaudeAccounts.swift"
+Lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+Reserved=" add list ls remove rm rename apps shortcuts usage build install help "
+
+show_help() {
+    cat <<'EOF'
+ccm - keep several Claude accounts open side by side in the desktop app
+
+  ccm add <name>     create an account window and its launcher app
+  ccm <name>         open that account's window, or bring it forward
+  ccm usage          open the usage window (lives in the menu bar)
+  ccm list           the same numbers as text
+  ccm rename <a> <b> give an account a different name (its window must be closed)
+  ccm remove <name>  delete an account window and its saved sign-in (history is kept)
+  ccm apps           recreate the launcher apps and their icons
+  ccm build          rebuild Claude accounts.app from ClaudeAccounts.swift
+  ccm install        build, and make the ccm command available in every terminal
+EOF
+}
+
+die() {
+    if [ -t 2 ]; then printf '\033[31mccm: %s\033[0m\n' "$*" >&2; else printf 'ccm: %s\n' "$*" >&2; fi
+    exit 1
+}
+
+account_dir() {
+    local name=${1:-}
+    [ -n "$name" ] || die 'Missing account name. See: ccm help'
+    if ! [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ $Reserved == *" $name "* ]]; then
+        die "'$name' is not a usable account name (letters, digits, . _ - only)."
+    fi
+    printf '%s/%s' "$Root" "$name"
+}
+
+existing_account_dir() {
+    local data
+    data=$(account_dir "$1") || exit 1
+    [ -d "$data" ] || die "No account '$1'. Create it with: ccm add $1"
+    printf '%s' "$data"
+}
+
+# Every process of a running window, its helpers included, carries the data folder
+# on its command line. ps runs first so this grep is not in the list it searches.
+is_open() {
+    local processes
+    processes=$(ps -axww -o command=)
+    printf '%s\n' "$processes" | sed 's/$/ /' | grep -qF -- "--user-data-dir=$1 "
+}
+
+xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+write_plist() {
+    local path=$1 executable=$2 id=$3 name=$4 extra=${5:-}
+    cat > "$path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>$executable</string>
+  <key>CFBundleIdentifier</key><string>$id</string>
+  <key>CFBundleName</key><string>$(xml "$name")</string>
+  <key>CFBundleDisplayName</key><string>$(xml "$name")</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleIconFile</key><string>icon</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>$extra
+</dict>
+</plist>
+EOF
+}
+
+# Tell Finder, the Dock and Spotlight that the bundle (and its icon) changed.
+register() {
+    touch "$1"
+    [ -x "$Lsregister" ] && "$Lsregister" -f "$1" >/dev/null 2>&1 || true
+}
+
+# Compile Claude accounts.app with the Swift compiler from the Xcode Command Line Tools.
+build_app() {
+    xcode-select -p >/dev/null 2>&1 && xcrun --find swiftc >/dev/null 2>&1 ||
+        die 'The Swift compiler was not found. Install the Xcode Command Line Tools: xcode-select --install'
+
+    local running=0 build output extra=""
+    if pgrep -x ClaudeAccounts >/dev/null; then
+        running=1
+        pkill -x ClaudeAccounts || true
+    fi
+    mkdir -p "$Root" "$UsageApp/Contents/MacOS" "$UsageApp/Contents/Resources"
+    build=$(mktemp -d)
+    if ! output=$(xcrun swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
+        -o "$build/ClaudeAccounts" "$Source" 2>&1); then
+        rm -rf "$build"
+        die "Build failed:
+$output"
+    fi
+    mv -f "$build/ClaudeAccounts" "$Exe"
+    rm -rf "$build"
+    # Apps opened from Finder or the Dock do not see CCM_HOME, so it goes into the app.
+    if [ -n "${CCM_HOME:-}" ]; then
+        extra="
+  <key>CCMHome</key><string>$(xml "$Root")</string>"
+    fi
+    write_plist "$UsageApp/Contents/Info.plist" ClaudeAccounts local.claude-accounts.usage 'Claude accounts' "$extra"
+    "$Exe" icon "$UsageApp/Contents/Resources/icon.icns" || true
+    codesign --force --sign - "$UsageApp" >/dev/null 2>&1 || true
+    register "$UsageApp"
+    [ $running -eq 1 ] && open -g "$UsageApp" --args tray
+    echo "Built $UsageApp"
+}
+
+# Build on first use, and again whenever the source is newer than the program.
+ensure_built() {
+    if [ ! -x "$Exe" ] || [ "$Source" -nt "$Exe" ]; then build_app >/dev/null; fi
+}
+
+# A tiny app per account, so it can be found in Spotlight and kept in the Dock. It
+# asks Claude accounts.app to open the window, which also brings an open one forward.
+# The icon is kept in the account folder too, for the account's copy of Claude.
+write_launcher() {
+    local name=$1 bundle="$Apps/Claude $1.app" icon="$Root/$1/ccm-icon.icns"
+    ensure_built
+    mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+    write_plist "$bundle/Contents/Info.plist" launcher "local.claude-accounts.account.$(printf '%s' "$name" | tr '_' '-')" "Claude $name"
+    printf '#!/bin/sh\nexec %s open %s\n' "$(quote "$Exe")" "$(quote "$name")" > "$bundle/Contents/MacOS/launcher"
+    chmod +x "$bundle/Contents/MacOS/launcher"
+    "$Exe" icon "$icon" "$name" && cp -f "$icon" "$bundle/Contents/Resources/icon.icns" || true
+    register "$bundle"
+}
+
+# The copy of Claude.app an account's window runs from (see ClaudeAccounts.swift).
+instance_app() { printf '%s/.apps/Claude %s.app' "$Root" "$1"; }
+
+update_apps() {
+    ensure_built
+    local data
+    for data in "$Root"/*/; do
+        [ -d "$data" ] || continue
+        data=${data%/}
+        [[ $(basename "$data") =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && write_launcher "$(basename "$data")"
+    done
+    register "$UsageApp"
+    echo "Launcher apps are in $Apps. Icons kept in the Dock may need a moment to update."
+}
+
+new_account() {
+    local name=${1:-} data
+    data=$(account_dir "$name") || exit 1
+    [ -e "$data" ] && die "Account '$name' already exists."
+    ensure_built
+    "$Exe" app-path >/dev/null 2>&1 || die 'The Claude desktop app is not installed (Claude.app not found).'
+    mkdir -p "$data"
+    write_launcher "$name"
+    echo "Created '$name'. Open \"Claude $name\" from Spotlight or $Apps, or run: ccm $name"
+}
+
+open_account() {
+    existing_account_dir "$1" >/dev/null || exit 1
+    ensure_built
+    "$Exe" open "$1"
+    echo "Opening Claude for '$1'."
+}
+
+remove_account() {
+    local name=${1:-} skip=${2:-} data answer
+    data=$(existing_account_dir "$name") || exit 1
+    is_open "$data" && die "The Claude window for '$name' is still running. Quit it first (Claude > Quit Claude)."
+    if [ "$skip" != "--yes" ]; then
+        read -r -p "Delete the '$name' window, its saved sign-in and local app data? Code history is kept. Type the name to confirm: " answer
+        [ "$answer" = "$name" ] || { echo 'Cancelled.'; return; }
+    fi
+    rm -rf -- "$Apps/Claude $name.app" "$(instance_app "$name")"
+    rm -rf -- "$data"
+    # Labels such as W1 count the accounts, so the others may have moved up.
+    update_apps >/dev/null
+    echo "Removed '$name'."
+}
+
+# The sign-in lives inside the folder, so it moves with it.
+rename_account() {
+    local old=${1:-} new=${2:-} from to
+    from=$(existing_account_dir "$old") || exit 1
+    to=$(account_dir "$new") || exit 1
+    [ -e "$to" ] && die "Account '$new' already exists."
+    is_open "$from" && die "The Claude window for '$old' is still running. Quit it first (Claude > Quit Claude)."
+    rm -rf -- "$Apps/Claude $old.app" "$(instance_app "$old")"
+    mv -- "$from" "$to"
+    write_launcher "$new"
+    echo "Renamed '$old' to '$new'."
+}
+
+# Link ccm into a folder that is already on PATH, preferring ones that need no sudo.
+install_ccm() {
+    build_app
+    update_apps
+    local target="" dir link note=""
+    for dir in "$HOME/.local/bin" "$HOME/bin" /opt/homebrew/bin /usr/local/bin; do
+        case ":$PATH:" in *":$dir:"*) if [ -d "$dir" ] && [ -w "$dir" ]; then target=$dir; break; fi ;; esac
+    done
+    if [ -z "$target" ]; then
+        target="$HOME/.local/bin"
+        mkdir -p "$target"
+        note="
+$target is not on your PATH yet. Add it with:
+  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zprofile"
+    fi
+    link="$target/ccm"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        [ -L "$link" ] && [ "$(readlink "$link")" = "$Here/ccm" ] ||
+            die "$link already exists and is not this ccm. Move it away and run ccm install again."
+    fi
+    ln -sf "$Here/ccm" "$link"
+    echo "Installed. 'ccm' now works in any new terminal (linked from $link).$note"
+}
+
+command=${1:-help}
+[ $# -gt 0 ] && shift
+
+case $command in
+    help | -h | --help) show_help ;;
+    add) new_account "${1:-}" ;;
+    list | ls) ensure_built; "$Exe" list ;;
+    usage) ensure_built; open "$UsageApp" ;;
+    remove | rm) remove_account "${1:-}" "${2:-}" ;;
+    rename) rename_account "${1:-}" "${2:-}" ;;
+    apps | shortcuts) update_apps ;;
+    build) build_app ;;
+    install) install_ccm ;;
+    *) open_account "$command" ;;
+esac
